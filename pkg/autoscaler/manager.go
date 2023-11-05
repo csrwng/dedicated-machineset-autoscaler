@@ -10,6 +10,7 @@ import (
 	_ "k8s.io/client-go/scale"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
 )
 
 type Options struct {
@@ -17,6 +18,7 @@ type Options struct {
 	ScaleDownInterval time.Duration
 	MinWarm           int
 	MaxWarm           int
+	DryMode           bool
 }
 
 func Run(ctx context.Context, opts *Options) error {
@@ -31,26 +33,44 @@ func Run(ctx context.Context, opts *Options) error {
 	restConfig.UserAgent = "Autoscaler controller"
 
 	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
-		Scheme:             Scheme,
-		MetricsBindAddress: "0",
+		Scheme: Scheme,
+		Metrics: server.Options{
+			BindAddress: "0",
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("unable to start manager: %w", err)
 	}
 
-	if err := (&ScaleUpReconciler{
+	scaleUpReconciler := &ScaleUpReconciler{
 		Client:   mgr.GetClient(),
 		Interval: opts.ScaleUpInterval,
 		MinWarm:  opts.MinWarm,
-	}).SetupWithManager(mgr); err != nil {
+	}
+	scaleUpReconciler.listNodesHandler = scaleUpReconciler.listServingComponentNodes
+	scaleUpReconciler.updateMachineSetHandler = scaleUpReconciler.updateMachineSet
+	if opts.DryMode {
+		scaleUpReconciler.updateMachineSetHandler = scaleUpReconciler.dryModeUpdateMachineSet
+	}
+	scaleUpReconciler.listMachineSetHandler = scaleUpReconciler.listMachineSet
+	if err := scaleUpReconciler.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("unable to setup scale up reconciler: %w", err)
 	}
 
-	if err := (&ScaleDownReconciler{
+	scaleDownReconciler := &ScaleDownReconciler{
 		Client:   mgr.GetClient(),
 		Interval: opts.ScaleDownInterval,
 		MaxWarm:  opts.MaxWarm,
-	}).SetupWithManager(mgr); err != nil {
+	}
+	scaleDownReconciler.listNodesHandler = scaleDownReconciler.listServingComponentNodes
+	scaleDownReconciler.updateMachineSetHandler = scaleDownReconciler.updateMachineSet
+	if opts.DryMode {
+		log.Info("Running in dry mode")
+		scaleDownReconciler.updateMachineSetHandler = scaleDownReconciler.dryModeUpdateMachineSet
+	}
+	scaleDownReconciler.listMachineSetHandler = scaleDownReconciler.listMachineSet
+	scaleDownReconciler.listMachinesHandler = scaleDownReconciler.listMachines
+	if err := scaleDownReconciler.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("unable to setup scale down reconciler: %w", err)
 	}
 
